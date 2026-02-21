@@ -1,0 +1,12 @@
+# 忽略巨大的模型权重和输出数据
+evaluation_outputs/
+*.pth
+*.pt
+*.ckpt
+
+# 忽略 Python 缓存和系统文件
+__pycache__/
+*.pyc
+
+# 忽略可能存在的环境依赖
+.conda/

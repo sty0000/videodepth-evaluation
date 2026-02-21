@@ -1,0 +1,191 @@
+import hydra
+import os
+import os.path as osp
+import torch
+import logging
+import json
+from omegaconf import DictConfig, ListConfig
+
+import sys
+add_paths = [
+    #r"/data/users/yihao/codes/CUT3R",
+    #r"/data/users/yihao/codes/CUT3R/src", 
+    #r"/data/users/yihao/codes/fast3r", 
+    r"/data/users/yihao/codes/FLARE", 
+    r"/data/users/yihao/codes/FLARE/dust3r",
+    r"/data/users/yihao/codes/Pi3"
+    ]
+sys.path.extend(add_paths)
+
+import rootutils
+root = rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+#from pi3.models.pi3 import Pi3
+#from depth_anything_3.model.da3_training import DepthAnything3Net
+
+from utils.interfaces import infer_videodepth
+from utils.files import get_all_sequences, list_imgs_a_sequence
+from utils.messages import set_default_arg
+from videodepth.utils import save_depth_maps
+from omegaconf import OmegaConf
+import numpy as np
+
+@hydra.main(version_base="1.2", config_path="../configs", config_name="eval")
+def main(hydra_cfg: DictConfig):
+    all_eval_datasets: ListConfig      = hydra_cfg.eval_datasets  # see configs/evaluation/videodepth.yaml
+    all_data_info: DictConfig          = hydra_cfg.data           # see configs/data/depth.yaml
+    pretrained_model_name_or_path: str = hydra_cfg.flare.pretrained_model_name_or_path  # see configs/evaluation/videodepth.yaml
+
+    # 0. create/load model
+    logger = logging.getLogger("videodepth-infer")
+    model = None
+    try:
+        from mast3r.model import AsymmetricMASt3R
+        logger.info(f"Loading FLARE from {pretrained_model_name_or_path}")
+        
+        # --- 完美的官方基因克隆 ---
+        inf = float('inf')
+        model = AsymmetricMASt3R(
+            wpose=False,  # 推理时禁用真实轨迹
+            pos_embed='RoPE100', 
+            patch_embed_cls='PatchEmbedDust3R', # 根据你代码之前的修复，保持 Dust3R
+            img_size=(512, 512), 
+            head_type='catmlp+dpt',  # 关键修复1
+            output_mode='pts3d+desc24', # 关键修复2
+            depth_mode=('exp', -inf, inf), 
+            conf_mode=('exp', 1, inf), 
+            enc_embed_dim=1024, 
+            enc_depth=24, 
+            enc_num_heads=16, 
+            dec_embed_dim=768, 
+            dec_depth=12, 
+            dec_num_heads=12, 
+            two_confs=True,  # 关键修复3
+            desc_conf_mode=('exp', 0, inf)
+        )
+        
+        ckpt = torch.load(pretrained_model_name_or_path, map_location='cpu')
+        state_dict = ckpt['model'] if 'model' in ckpt else ckpt
+        
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        logger.info(f"FLARE model weights injected. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+        
+        model = model.to(hydra_cfg.device).eval()
+
+        # === 绝对暴力的动态属性注入 ===
+        # 1. 鸭子类型遍历... (保留这段)
+        for name, module in model.named_modules():
+            if hasattr(module, 'proj') and hasattr(module.proj, 'out_channels'):
+                module.embed_dim = module.proj.out_channels
+        
+        # 2. 定向硬编码补刀... (保留这段)
+        if hasattr(model, 'patch_embed_coarse1'):
+            model.patch_embed_coarse1.embed_dim = 1024
+        if hasattr(model, 'patch_embed_coarse2'):
+            model.patch_embed_coarse2.embed_dim = 1024
+
+        # 3. 终极防御：利用 Forward Hook 解决 AMP 原地赋值时的类型严格对齐问题
+        def force_float32_output(module, input, output):
+            return output.to(torch.float32)
+            
+        for module in model.modules():
+            if module.__class__.__name__ == 'PatchEmbedDust3R' and hasattr(module, 'proj'):
+                # 在底层卷积输出后强制转换回 Float32，适配外部的 x_coarse 容器
+                module.proj.register_forward_hook(force_float32_output)
+        # ==================================
+
+    except Exception as e:
+        logger.warning(f"Failed to load FLARE: {e}")
+        raise e
+
+    for idx_dataset, dataset_name in enumerate(all_eval_datasets, start=1):
+        if dataset_name not in all_data_info:
+            raise ValueError(f"Unknown dataset in global data information: {dataset_name}")
+        dataset_info = all_data_info[dataset_name]
+        
+        output_root = osp.join(hydra_cfg.output_dir, dataset_name)  # 移到前面
+        logger.info(f"[{idx_dataset}/{len(all_eval_datasets)}] Infering videodepth on {dataset_name} dataset...")
+
+        if dataset_info.type == "squid":
+            # SQUID 特殊处理：场景 -> image_set -> 两张图
+            from utils.files import get_squid_image_sets, list_squid_imgs_an_image_set
+            
+            total_sets = 0
+            processed = 0
+            for scene in dataset_info.ls_all_seqs:
+                image_sets = get_squid_image_sets(dataset_info, scene)
+                total_sets += len(image_sets)
+                
+                for image_set in image_sets:
+                    filelist = list_squid_imgs_an_image_set(dataset_info, scene, image_set)
+                    if filelist is None:
+                        continue
+                    
+                    save_dir = osp.join(output_root, scene, image_set)
+                    
+                    # 跳过已处理的
+                    if not hydra_cfg.overwrite and osp.isdir(save_dir) and len(os.listdir(save_dir)) >= 2:
+                        processed += 1
+                        continue
+                    
+                    # 推理
+                    time_used, depth_maps = infer_videodepth(filelist, model, hydra_cfg)
+                    logger.info(f"[{scene}/{image_set}] processed, time: {time_used}")
+                    
+                    # 保存
+                    os.makedirs(save_dir, exist_ok=True)
+                    save_depth_maps(depth_maps, save_dir)
+                    with open(osp.join(save_dir, "_time.json"), "w") as f:
+                        json.dump({"time": time_used, "frames": len(filelist)}, f, indent=4)
+                    processed += 1
+            
+            logger.info(f"SQUID: processed {processed}/{total_sets} image_sets")
+            continue  # 跳过后面的 video 类型处理
+        
+        elif dataset_info.type == "video":
+            seq_list = get_all_sequences(dataset_info)
+        elif dataset_info.type == "mono":
+            raise ValueError("dataset type `mono` is not supported for videodepth evaluation")
+        else:
+            raise ValueError(f"Unknown dataset type: {dataset_info.type}")
+
+        model = model.eval()
+        output_root = osp.join(hydra_cfg.output_dir, dataset_name)
+        logger.info(f"[{idx_dataset}/{len(all_eval_datasets)}] Infering videodepth on {dataset_name} dataset..., output to {osp.relpath(output_root, hydra_cfg.work_dir)}")
+
+        # 3. infer for each sequence (video)
+        for seq_idx, seq in enumerate(seq_list, start=1):
+            filelist = list_imgs_a_sequence(dataset_info, seq)
+            # uniformly sample frames if max_frames is set
+            max_frames = hydra_cfg.get("max_frames", None)
+            if max_frames is not None and len(filelist) > max_frames:
+                indices = np.linspace(0, len(filelist) - 1, max_frames, dtype=int)
+                filelist = [filelist[i] for i in indices]
+            save_dir = osp.join(output_root, seq)
+
+            if not hydra_cfg.overwrite and (osp.isdir(save_dir) and len(os.listdir(save_dir)) == 2 * len(filelist) + 1):
+                logger.info(f"[{seq_idx}/{len(seq_list)}] Sequence {seq} already processed, skipping.")
+                continue
+            
+            # time_used: float, or List[float] (len = 2)
+            # depth_maps: (N, H, W), torch.Tensor
+            # conf_self: (N, H, W) torch.Tensor, or just None is ok
+            time_used, depth_maps= infer_videodepth(filelist, model, hydra_cfg)
+            logger.info(f"[{seq_idx}/{len(seq_list)}] Sequence {seq} processed, time: {time_used}, saving depth maps...")
+
+            os.makedirs(save_dir, exist_ok=True)
+            save_depth_maps(depth_maps, save_dir)
+            # save time
+            with open(osp.join(save_dir, "_time.json"), "w") as f:
+                json.dump({
+                    "time": time_used,
+                    "frames": len(filelist),
+                }, f, indent=4)
+    del model
+    torch.cuda.empty_cache()
+
+
+if __name__ == "__main__":
+    set_default_arg("evaluation", "videodepth")
+    os.environ["HYDRA_FULL_ERROR"] = '1'
+    with torch.no_grad():
+        main()

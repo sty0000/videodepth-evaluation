@@ -1,0 +1,44 @@
+# @package _global_
+
+defaults:
+  - override /data: depth
+
+name: videodepth
+
+pi3:
+  pretrained_model_name_or_path: /data/users/yihao/codes/checkpoints/Pi3
+
+da3:
+  pretrained_model_name_or_path: /data/users/jiayi/wat3r/outputs/train_da3_depth_attenpool_v1/ckpts/best_model/pytorch_model.bin
+
+fast3r:
+  pretrained_model_name_or_path: /data/users/yihao/codes/checkpoints/Fast3R_ViT_Large_512
+
+flare:
+  pretrained_model_name_or_path: /data/users/yihao/codes/checkpoints/flare/geometry_pose.pth
+
+cut3r:
+  pretrained_model_name_or_path: /data/users/yihao/codes/checkpoints/cut3r/cut3r_512_dpt_4_64.pth
+
+eval_datasets:
+  # - sintel
+  # - bonn
+  # - kitti
+  - flsea-canyons
+  # - flsea-redsea
+  # - seathru
+  - squid
+
+
+# align: scale
+align: scale&shift
+
+overwrite: False
+no_crop: True
+load_img_size: 512
+
+device: cuda
+
+verbose: False
+max_frames: 100
+save_suffix: null
