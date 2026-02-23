@@ -22,7 +22,7 @@ root = rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True
 #from pi3.models.pi3 import Pi3
 #from depth_anything_3.model.da3_training import DepthAnything3Net
 
-from utils.interfaces import infer_videodepth
+from utils.interfaces_flare import infer_videodepth
 from utils.files import get_all_sequences, list_imgs_a_sequence
 from utils.messages import set_default_arg
 from videodepth.utils import save_depth_maps

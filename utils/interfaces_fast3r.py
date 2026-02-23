@@ -125,7 +125,6 @@ def infer_monodepth(file: str, model: Pi3, hydra_cfg: DictConfig):
 def infer_videodepth(filelist: str, model: Pi3, hydra_cfg: DictConfig):
 
     imgs = load_and_resize14(filelist, new_width=hydra_cfg.load_img_size, device=hydra_cfg.device, verbose=hydra_cfg.verbose)
-
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
     start = time.time()
@@ -135,50 +134,28 @@ def infer_videodepth(filelist: str, model: Pi3, hydra_cfg: DictConfig):
             pred = model(views)
     end = time.time()
 
-    # depth_map = pred['local_points'][0, ..., -1]  # (N, h_14, w_14)
-    # depth_conf = pred['conf'][0, ..., 0]          # (N, h_14, w_14)
-    def _extract_depth_from_pred(pred_out):
-        # pred_out can be list (per-view) or dict
-        src = None
-        if isinstance(pred_out, list):
-            if len(pred_out) == 0:
-                raise RuntimeError("Empty model output list")
-            # use first view's outputs
-            src = pred_out[0]
-        elif isinstance(pred_out, dict):
-            src = pred_out
-        else:
-            raise TypeError("Unsupported model output type")
+    # === 强契约提取：拒绝一切模糊猜测 ===
+    # 明确 Fast3R/Pi3 模型的相机坐标系点云键名 (请确认你的模型使用的是 pts3d_local 还是 local_points)
+    target_key = 'pts3d_local' 
+    
+    if target_key not in pred:
+        raise KeyError(f"Fatal Error: Model output missing strictly required key '{target_key}'. Available keys: {pred.keys()}")
+    
+    # 获取相机坐标系 3D 点云
+    pts_cam = pred[target_key]
+    
+    # 明确维度提取 (假设输出是 B=1, 提取 batch 0)
+    # 此时的 pts_cam[0] shape 应当严格是 (N, H, W, 3) 或 (H, W, 3)
+    pts_cam_squeeze = pts_cam[0] 
+    
+    # 提取相机坐标系深度 Z
+    depth_map = pts_cam_squeeze[..., -1].detach().cpu()
+    
+    # --- 不要忘了上一回合确认的物理防御 ---
+    # 剔除相机背后 (Z <= 0) 的无效网络噪点
+    valid_mask = depth_map > 0
+    depth_map = depth_map * valid_mask
 
-        # try known key first
-        for k in ('local_points', 'points', 'pts3d_local', 'pts3d', 'pts3d_in_other_view'):
-            if k in src:
-                val = src[k]
-                if torch.is_tensor(val):
-                    return val
-
-        # fallback: scan values for tensor whose last dim == 3
-        for v in src.values():
-            if torch.is_tensor(v) and v.dim() >= 1 and v.shape[-1] == 3:
-                return v
-
-        raise KeyError("Cannot find 3D points tensor in model output")
-
-    pts = _extract_depth_from_pred(pred)  # tensor with last dim == 3
-    # pts shape could be (B, H, W, 3) or (B, N, h, w, 3) or (N, h, w, 3) etc.
-    if pts.dim() >= 4 and pts.shape[-1] == 3:
-        # take first batch if present, then take last channel as depth
-        if pts.dim() == 4:  # (B, H, W, 3)
-            depth_map = pts[0, ..., -1]
-        elif pts.dim() == 5:  # (B, N, h, w, 3) -> collapse first two dims (views)
-            depth_map = pts.reshape(-1, pts.shape[-2], pts.shape[-1])[:, :, -1]
-        else:
-            # generic: take first sample and last channel
-            depth_map = pts.reshape(pts.shape[0], -1, 3)[0, :, -1].reshape(-1, pts.shape[-1])
-    elif pts.dim() == 3 and pts.shape[-1] == 3:
-        depth_map = pts[..., -1]
-    else:
-        raise RuntimeError(f"Unexpected pts shape: {pts.shape}")
     return end - start, depth_map
 
 

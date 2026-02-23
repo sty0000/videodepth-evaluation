@@ -183,11 +183,41 @@ def infer_videodepth(filelist: List[str], model: any, hydra_cfg: DictConfig):
                 
                 # 推理当前小块
                 res1, res2, pred_cameras = model([view1], [view2])
+                debug()  # 在这里设置断点，检查 res1、res2 和 pred_cameras 的内容，确保它们包含预期的键和值
                 
         # === 解析原生输出 ===
         if 'pts3d' in res1:
-            pts = res1['pts3d'][:, 0]  # (B, H, W, 3)
-            depth_chunk = pts[..., -1].detach().cpu()  
+            #pts = res1['pts3d'][:, 0]  # (B, H, W, 3)
+            #depth_chunk = pts[..., -1].detach().cpu()  
+            # 1. pts_world 是世界坐标系下的点云 (B, H, W, 3)
+            # 关键：必须临时转换为 float32 进行几何运算，防止 bfloat16 的低精度导致空间旋转产生数值畸变
+            pts_world = res1['pts3d'][:, 0].to(torch.float32) 
+            B, H, W, _ = pts_world.shape
+            
+            # 2. 提取最后一次迭代收敛的相机位姿
+            final_cameras = pred_cameras[-1]
+            
+            # 3. 提取 view1 的 C2W 旋转 R 和平移 T
+            # final_cameras['R'] 的 shape 是 (B, 2, 3, 3)，[:, 0] 取出 view1
+            R_c2w = final_cameras['R'][:, 0].to(torch.float32)  # (B, 3, 3)
+            T_c2w = final_cameras['T'][:, 0].to(torch.float32)  # (B, 3)
+            
+            # 4. 执行数学求逆，构建 W2C 位姿
+            R_w2c = R_c2w.transpose(1, 2)  # (B, 3, 3)
+            # bmm 处理批量矩阵向量乘法: (B, 3, 3) @ (B, 3, 1) -> (B, 3)
+            T_w2c = -torch.bmm(R_w2c, T_c2w.unsqueeze(-1)).squeeze(-1)  
+            
+            # 5. 高性能空间投影： P_c = R_w2c @ P_w + T_w2c
+            # einsum 'bij,bhwj->bhwi' 等价于在每个像素的 3D 向量上做矩阵乘法
+            pts_cam = torch.einsum('bij,bhwj->bhwi', R_w2c, pts_world) + T_w2c.view(-1, 1, 1, 3)
+            
+            # 6. 提取相机坐标系的真实深度 Z，并还原到原始精度 (bfloat16/float16)
+            pts_cam = pts_cam.to(res1['pts3d'].dtype)
+            depth_chunk = pts_cam[..., -1].detach().cpu()
+            
+            # 7. 物理防御性 Mask：剔除因网络回归失效导致在相机背后的噪点 (Z <= 0)
+            valid_mask = depth_chunk > 0
+            depth_chunk = depth_chunk * valid_mask
             all_depth_maps.append(depth_chunk)
         else:
             raise KeyError(f"Could not extract depth. Available keys: {res1.keys()}")
@@ -198,9 +228,6 @@ def infer_videodepth(filelist: List[str], model: any, hydra_cfg: DictConfig):
     end = time.time()
 
     depth_maps = torch.cat(all_depth_maps, dim=0)
-
-    filtered_depth_maps = torch.clamp(depth_maps, min=1e-3)
-    print(f"Depth tensor stats - Min: {filtered_depth_maps.min().item():.4f}, Max: {filtered_depth_maps.max().item():.4f}, Mean: {filtered_depth_maps.mean().item():.4f}")
 
     return end - start, depth_maps
 
